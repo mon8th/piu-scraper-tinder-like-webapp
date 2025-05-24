@@ -184,3 +184,6 @@ chromedriver-*
 **/chromedriver-*
 .wdm/
 drivers/
+
+images/
+profile_pictures/
