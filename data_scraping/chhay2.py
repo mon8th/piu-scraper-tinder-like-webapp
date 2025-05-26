@@ -1,6 +1,10 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import time
@@ -10,6 +14,7 @@ import re
 from urllib.parse import urljoin
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FACILITIES = {
     '01': {'name': 'Engineering', 'departments': {
@@ -40,15 +45,35 @@ def create_student_ids(years, student_max=35):
                     student_ids.append(student_id)
     return student_ids
 
-def scrape_student(student_id):
+def setup_driver():
     options = Options()
     options.add_argument('--headless')
-    browser = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    
+    try:
+        browser = webdriver.Chrome(options=options)
+    except:
+        browser = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    
+    return browser
+
+def scrape_student(student_id, browser=None):
+    should_close = False
+    if browser is None:
+        browser = setup_driver()
+        should_close = True
     
     try: 
         url = f"https://my.paragoniu.edu.kh/qr?student_id={student_id}" 
         browser.get(url)
-        time.sleep(10)  
+        
+        try:
+            wait = WebDriverWait(browser, 5) 
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".v-data-table table tbody tr, .key-value-table tr")))
+        except TimeoutException:
+            print(f"Timeout waiting for data for student ID: {student_id}")
         
         html = browser.page_source
         soup = BeautifulSoup(html, 'html.parser')
@@ -96,16 +121,13 @@ def scrape_student(student_id):
         else:
             print(f"No profile image found for student ID: {student_id}")
         
-        print("\nExtracted Student Information:")
-        print(f"Name: {student_data.get('Name', 'Not found')}")
-        print(f"ID Number: {student_data.get('ID Number', 'Not found')}")
-        print(f"Faculty: {student_data.get('Faculty', 'Not found')}")
-        print(f"Department: {student_data.get('Department', 'Not found')}")
-        print(f"Enrollment Status: {student_data.get('Enrollment Status', 'Not found')}")
+        # Simplified output to reduce terminal clutter
+        print(f"✓ {student_id}: {student_data.get('Name', 'Not found')}")
         return student_data
             
     finally: 
-        browser.quit()
+        if should_close:
+            browser.quit()
 
 def save_csv(results, filename='students.csv'):
     if not results or len(results) == 0:
@@ -128,28 +150,74 @@ def save_csv(results, filename='students.csv'):
                 writer.writerow(result)
     print(f"Data saved to {filename}")
             
+def save_batch(results, batch_num):
+    if not results:
+        return
+    
+    csv_filename = f'students_batch_{batch_num}.csv'
+    save_csv(results, filename=csv_filename)
+    
+    json_filename = f'student_data_batch_{batch_num}.json'
+    with open(json_filename, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
+    
+    print(f"Saved batch {batch_num} with {len(results)} records")
+
 def main():
-    years = ['21', '22'] 
-    student_max = 5  
+    years = ['22'] 
+    student_max = 35  
     
     student_ids = create_student_ids(years, student_max)
     print(f"Generated {len(student_ids)} student IDs.")
     
-    results = []
-    for student_id in student_ids:
-        print(f"Scraping data for student ID: {student_id}")
-        result = scrape_student(student_id)  
-        if result:
-            results.append(result)
-        
-        time.sleep(1)  
-        
-    save_csv(results)
+    # Number of parallel workers
+    max_workers = 5
+    # Batch size for saving progress
+    batch_size = 50
     
-    with open('student_data.json', 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=4)
+    all_results = []
+    batch_num = 1
     
-    print(f"Scraped {len(results)} students successfully out of {len(student_ids)} attempts")
+    # Create a pool of browser instances to be reused
+    browsers = [setup_driver() for _ in range(max_workers)]
+    
+    try:
+        for i in range(0, len(student_ids), batch_size):
+            batch_ids = student_ids[i:i+batch_size]
+            batch_results = []
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_id = {
+                    executor.submit(scrape_student, student_id, browsers[idx % len(browsers)]): student_id
+                    for idx, student_id in enumerate(batch_ids)
+                }
+                
+                for future in as_completed(future_to_id):
+                    student_id = future_to_id[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            batch_results.append(result)
+                    except Exception as exc:
+                        print(f"{student_id} generated an exception: {exc}")
+                        
+            all_results.extend(batch_results)
+            save_batch(batch_results, batch_num)
+            batch_num += 1
+    
+    finally:
+        for browser in browsers:
+            try:
+                browser.quit()
+            except:
+                pass
+    
+    save_csv(all_results, filename='students_complete.csv')
+    
+    with open('student_data_complete.json', 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=4)
+    
+    print(f"Scraped {len(all_results)} students successfully out of {len(student_ids)} attempts")
 
 if __name__ == "__main__":
     main()
