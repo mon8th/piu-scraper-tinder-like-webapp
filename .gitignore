@@ -186,3 +186,9 @@ chromedriver-*
 drivers/
 
 images/
+
+student_data*
+students_batch*
+students_complete*
+
+.DS_Store
